@@ -1,100 +1,108 @@
-# bot.py
+import os
 import asyncio
 from telethon import TelegramClient, events
 from telethon.errors import UsernameNotOccupiedError
-from datetime import datetime, timedelta
+from telethon.tl.types import User
+from telethon.tl.functions.users import GetFullUserRequest
+from datetime import datetime
 import statistics
 
-# ─── НАСТРОЙКИ ─────────────────────────────────────────────────────
-api_id   = 1234567           # ваш API ID
-api_hash = 'abcdef1234567890abcdef1234567890'
-bot_token= '1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+# ─── ПОДСТЯЖКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ───────────────────────────────
+api_id    = int(os.environ['API_ID'])
+api_hash  = os.environ['API_HASH']
+bot_token = os.environ['BOT_TOKEN']
 
-# сколько последних сообщений анализировать для статистики
-HISTORY_LIMIT = 100  
+# ─── КОНСТАНТЫ ─────────────────────────────────────────────────────
+HISTORY_LIMIT = 100  # сколько последних сообщений анализировать
 
 # ─── ИНИЦИАЛИЗАЦИЯ TELETHON ──────────────────────────────────────
 client = TelegramClient('bot_session', api_id, api_hash)
 client.start(bot_token=bot_token)
 
-
-# ─── ФУНКЦИЯ СБОРА ИНФЫ ───────────────────────────────────────────
+# ─── ФУНКЦИЯ СБОРА ИНФОРМАЦИИ ─────────────────────────────────────
 async def fetch_info(entity):
-    info = {}
-    # 1) Тип аккаунта
-    info['type'] = entity.__class__.__name__  # Channel, Chat, User, etc.
-    
-    # 2) Кол-во подписчиков / участников
-    try:
-        count = await client.get_participants(entity, limit=0)
-        info['subscribers'] = count.total  # точное число
-    except:
-        info['subscribers'] = 'неизвестно'
-    
-    # 3) Дата первого сообщения → приближенно дата создания канала/группы
-    first = None
-    async for msg in client.iter_messages(entity, limit=1, reverse=True):
-        first = msg
-    info['creation_date'] = first.date.strftime('%Y-%m-%d') if first else '—'
+    info = {
+        'type': entity.__class__.__name__,
+        'id': entity.id,
+        'username': getattr(entity, 'username', None),
+        'name': getattr(entity, 'title', None) or f"{getattr(entity, 'first_name','') or ''} {getattr(entity,'last_name','') or ''}".strip()
+    }
 
-    # 4) Статистика по последним HISTORY_LIMIT сообщениям
+    # подписчики/участники (для каналов и групп)
+    try:
+        info['subscribers'] = (await client.get_participants(entity, limit=0)).total
+    except:
+        info['subscribers'] = None
+
+    # доп. для обычных пользователей
+    if isinstance(entity, User):
+        full = await client(GetFullUserRequest(entity.id))
+        info.update({
+            'is_bot': entity.bot,
+            'is_verified': getattr(full.user, 'bot_info', None) is not None,
+            'phone': getattr(full.user, 'phone', None),
+            'about': getattr(full, 'about', ''),
+            'about_len': len(getattr(full, 'about', '')),
+            'status': str(getattr(entity, 'status', '')),
+            'photos_count': (await client.get_profile_photos(entity, limit=0)).total,
+            'common_chats': full.common_chats_count,
+        })
+
+    # определяем примерную дату создания — по первому сообщению
+    first_msg = None
+    async for m in client.iter_messages(entity, limit=1, reverse=True):
+        first_msg = m
+    info['creation_date'] = first_msg.date.strftime('%Y-%m-%d') if first_msg else None
+
+    # анализ последних HISTORY_LIMIT сообщений
     msgs = []
-    async for msg in client.iter_messages(entity, limit=HISTORY_LIMIT):
-        if msg.date and msg.message:  # фильтруем системные
-            msgs.append(msg)
+    async for m in client.iter_messages(entity, limit=HISTORY_LIMIT):
+        if m.date and m.message:
+            msgs.append(m)
+
     info['total_posts'] = len(msgs)
-    # подсчёт по дням
+    # посчитаем посты в день
     days = [m.date.date() for m in msgs]
     counts = {}
     for d in days:
         counts[d] = counts.get(d, 0) + 1
-    # среднее и медиана постов в день
     per_day = list(counts.values())
-    info['avg_per_day'] = round(statistics.mean(per_day),2) if per_day else 0
+    info['avg_per_day'] = round(statistics.mean(per_day), 2) if per_day else 0
     info['median_per_day'] = statistics.median(per_day) if per_day else 0
 
-    # 5) Активность реакций
-    total_reacts = 0
-    for m in msgs:
-        if m.reactions:
-            total_reacts += sum(r.count for r in m.reactions.reactions)
+    # реакции
+    total_reacts = sum(
+        sum(r.count for r in m.reactions.reactions)
+        for m in msgs
+        if m.reactions
+    )
     info['has_reactions'] = total_reacts > 0
 
     return info
 
-
 # ─── ОБРАБОТЧИК КОМАНДЫ /info ─────────────────────────────────────
-@client.on(events.NewMessage(pattern=r'/info(?: |$)(.*)'))
+@client.on(events.NewMessage(pattern=r'/info(?: |$)(.+)'))
 async def handler(event):
-    arg = event.pattern_match.group(1).strip()
-    if not arg:
-        return await event.reply("Используй: /info <username_or_link>")
+    target = event.pattern_match.group(1).strip()
+    # если ссылка вида https://t.me/…
+    if target.startswith('http'):
+        target = target.rstrip('/').split('/')[-1]
 
-    # нормализуем: если ссылка вида https://t.me/...
-    username = arg.split('/')[-1]
     try:
-        entity = await client.get_entity(username)
+        entity = await client.get_entity(target)
     except UsernameNotOccupiedError:
-        return await event.reply("Пользователь или канал не найден.")
+        return await event.reply("❌ Не найден пользователь или канал.")
     except Exception as e:
-        return await event.reply(f"Ошибка при получении сущности: {e}")
+        return await event.reply(f"❌ Ошибка: {e}")
 
-    msg = await event.reply("Собираю информацию…")
+    await event.reply("🔍 Собираю информацию…")
     info = await fetch_info(entity)
 
-    text = (
-        f"📊 Информация по `{username}`:\n"
-        f"• Тип: `{info['type']}`\n"
-        f"• Подписчиков: `{info['subscribers']}`\n"
-        f"• Примерная дата создания: `{info['creation_date']}`\n"
-        f"• Всего постов в последних {len(days := info.get('total_posts',0))} сообщениях: `{len(days)}`\n"
-        f"• Среднее/медиана постов в день: `{info['avg_per_day']}` / `{info['median_per_day']}`\n"
-        f"• Есть реакции: `{info['has_reactions']}`"
-    )
-    await msg.edit(text)
+    # форматируем ответ
+    lines = [f"• {k}: {v}" for k, v in info.items()]
+    await event.reply("📊 Информация:\n" + "\n".join(lines))
 
-
-# ─── ЗАПУСК БОТА ──────────────────────────────────────────────────
+# ─── СТАРТ БОТА ──────────────────────────────────────────────────
 def main():
     print("Бот запущен…")
     client.run_until_disconnected()
