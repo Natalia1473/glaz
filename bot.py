@@ -1,22 +1,39 @@
 import os
 import asyncio
+import threading
 from datetime import datetime
 import statistics
+import http.server
+import socketserver
 
 from telethon import TelegramClient, events
 from telethon.errors import UsernameNotOccupiedError
 from telethon.tl.types import User
 from telethon.tl.functions.users import GetFullUserRequest
 
-# ─── ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ────────────────────────────────────────
+# ─── ОКРУЖЕНИЕ ─────────────────────────────────────────────────────
 API_ID    = int(os.environ['API_ID'])
 API_HASH  = os.environ['API_HASH']
 BOT_TOKEN = os.environ['BOT_TOKEN']
+PORT      = int(os.environ.get('PORT', 8000))
 
 # ─── КОНСТАНТЫ ─────────────────────────────────────────────────────
 HISTORY_LIMIT = 100  # сколько последних сообщений анализировать
 
-# ─── ИНИЦИАЛИЗАЦИЯ TELETHON ──────────────────────────────────────
+# ─── HTTP-PING СЕРВЕР (чтобы Render видел открытый порт) ───────────
+class PingHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, fmt, *args):
+        return  # без логов
+
+def run_http():
+    with socketserver.TCPServer(("", PORT), PingHandler) as httpd:
+        httpd.serve_forever()
+
+# ─── TELETHON БОТ ──────────────────────────────────────────────────
 client = TelegramClient('bot_session', API_ID, API_HASH)
 client.start(bot_token=BOT_TOKEN)
 
@@ -25,16 +42,18 @@ async def fetch_info(entity):
         'type': entity.__class__.__name__,
         'id': entity.id,
         'username': getattr(entity, 'username', None),
-        'name': getattr(entity, 'title', None) or f"{getattr(entity, 'first_name','')} {getattr(entity,'last_name','')}".strip()
+        'name': getattr(entity, 'title', None) or (
+            f"{getattr(entity,'first_name','')} {getattr(entity,'last_name','')}".strip()
+        )
     }
 
-    # подписчики/участники (для каналов и групп)
+    # подписчики/участники
     try:
         info['subscribers'] = (await client.get_participants(entity, limit=0)).total
     except:
         info['subscribers'] = None
 
-    # дополнительные поля для обычных пользователей
+    # данные для обычных пользователей
     if isinstance(entity, User):
         full = await client(GetFullUserRequest(entity.id))
         info.update({
@@ -48,7 +67,7 @@ async def fetch_info(entity):
             'common_chats': full.common_chats_count,
         })
 
-    # примерная дата создания (по первому сообщению)
+    # дата первого сообщения → прибл. дата создания
     first_msg = None
     async for m in client.iter_messages(entity, limit=1, reverse=True):
         first_msg = m
@@ -99,6 +118,8 @@ async def handler(event):
     await event.reply("📊 Информация:\n" + "\n".join(lines))
 
 def main():
+    # старт HTTP-сервера в фоне
+    threading.Thread(target=run_http, daemon=True).start()
     print("Бот запущен…")
     client.run_until_disconnected()
 
