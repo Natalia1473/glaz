@@ -1,1 +1,3 @@
 telethon==1.30.0
+phonenumbers
+requests
