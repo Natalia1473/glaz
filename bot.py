@@ -5,9 +5,14 @@ from datetime import datetime
 
 from telethon import TelegramClient, events
 from telethon.errors import UsernameNotOccupiedError
-from telethon.tl.types import User, InputPhoneContact
+from telethon.tl.types import (
+    User, UserStatusOnline, UserStatusOffline,
+    UserStatusRecently, UserStatusLastWeek, UserStatusLastMonth,
+    InputPhoneContact
+)
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
+from telethon.tl.functions.messages import GetCommonChatsRequest
 
 import http.server
 import socketserver
@@ -16,98 +21,55 @@ import phonenumbers
 from phonenumbers import geocoder, carrier, timezone
 import requests
 
-# ─── ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ─────────────────────────────────────────
+# ─── ENV ─────────────────────────────────────────────────────────
 API_ID        = int(os.environ['API_ID'])
 API_HASH      = os.environ['API_HASH']
-NUMVERIFY_KEY = os.environ.get('NUMVERIFY_KEY')  # опционально
+NUMVERIFY_KEY = os.environ.get('NUMVERIFY_KEY')
 PORT          = int(os.environ.get('PORT', 8000))
 
-# ─── HTTP-ping для Render ─────────────────────────────────────────
-class PingHandler(http.server.BaseHTTPRequestHandler):
+# ─── HTTP-PING ──────────────────────────────────────────────────
+class Ping(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, *args):
-        pass
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+    def log_message(self,*args): pass
 
-def run_http():
-    with socketserver.TCPServer(("", PORT), PingHandler) as srv:
-        srv.serve_forever()
+threading.Thread(target=lambda: socketserver.TCPServer(("", PORT), Ping).serve_forever(), daemon=True).start()
 
-# запускаем сервер сразу, чтобы порт был открыт
-threading.Thread(target=run_http, daemon=True).start()
-
-# ─── ИНИЦИАЛИЗАЦИЯ TELETHON (user-сессия) ─────────────────────────
+# ─── INIT TELETHON ───────────────────────────────────────────────
 client = TelegramClient('user_session', API_ID, API_HASH)
 client.start()
 
-# ─── /start ───────────────────────────────────────────────────────
-@client.on(events.NewMessage(incoming=True, outgoing=True, pattern=r'^/start$'))
-async def start_handler(event):
-    me = await client.get_me()
-    await event.reply(
-        f"🟢 Я запущен как @{me.username}\n"
-        "Отправь мне ссылку на Telegram-аккаунт или номер:\n"
-        "`/info <username_or_link_or_phone>`"
-    )
+# ─── HELPERS ─────────────────────────────────────────────────────
+def format_status(status):
+    if status is None:
+        return '—'
+    if isinstance(status, UserStatusOnline):
+        return 'online'
+    if isinstance(status, UserStatusOffline):
+        return status.was_online.strftime('%Y-%m-%d %H:%M')
+    # Recent / LastWeek / LastMonth etc.
+    name = type(status).__name__.replace('UserStatus','')
+    return name
 
-# ─── СБОР ИНФОРМАЦИИ О USER ────────────────────────────────────────
-async def fetch_user_info(u: User):
-    full = await client(GetFullUserRequest(u.id))
-    data = getattr(full, 'full_user', full)
+async def get_common_chats(u):
+    r = await client(GetCommonChatsRequest(user_id=u.id, max_id=0, limit=5))
+    return [getattr(c, 'title', None) or c.username or '—' for c in r.chats]
 
-    # последний онлайн
-    last_seen = getattr(u.status, 'was_online', None)
-    last_seen_str = last_seen.strftime('%Y-%m-%d %H:%M') if last_seen else '—'
+def analyze_phone_osint(number: str):
+    # сюда можно подключить внешние OSINT-API: Pipl, HaveIBeenPwned, Truecaller и т.п.
+    return {}
 
-    # проверка телефона на регистрацию в Telegram
-    phone = getattr(data, 'phone', None)
-    tg_phone_registered = False
-    if phone:
-        try:
-            contact = InputPhoneContact(client_id=0, phone=phone, first_name="", last_name="")
-            res = await client(ImportContactsRequest(contacts=[contact]))
-            tg_phone_registered = bool(res.users)
-            if tg_phone_registered:
-                await client(DeleteContactsRequest(id=[u.id for u in res.users]))
-        except:
-            tg_phone_registered = False
-
-    return {
-        'id':               u.id,
-        'username':         u.username or '—',
-        'name':             f"{u.first_name or ''} {u.last_name or ''}".strip() or '—',
-        'is_bot':           u.bot,
-        'is_verified':      bool(getattr(data, 'bot_info', None)),
-        'last_seen':        last_seen_str,
-        'about_len':        len(getattr(data, 'about', '') or ''),
-        'photos_count':     (await client.get_profile_photos(u, limit=0)).total,
-        'common_chats':     getattr(data, 'common_chats_count', 0),
-        'phone':            phone or '—',
-        'tg_phone_reg':     tg_phone_registered
-    }
-
-# ─── ПРОСТАЯ ЭВРИСТИКА «ФЕЙКА» ────────────────────────────────────
-def check_fake(info: dict):
-    reasons = []
-    if info['about_len']    == 0: reasons.append("нет био")
-    if info['photos_count'] == 0: reasons.append("нет фото профиля")
-    if info['common_chats'] == 0: reasons.append("нет общих чатов")
-    return len(reasons) >= 2, reasons
-
-# ─── АНАЛИЗ НОМЕРА ────────────────────────────────────────────────
 def analyze_phone(number: str):
-    pn        = phonenumbers.parse(number, None)
-    valid     = phonenumbers.is_valid_number(pn)
-    country   = geocoder.description_for_number(pn, "en") or '—'
-    operator  = carrier.name_for_number(pn, "en") or '—'
-    tz_list   = timezone.time_zones_for_number(pn)
+    pn      = phonenumbers.parse(number, None)
+    valid   = phonenumbers.is_valid_number(pn)
+    country = geocoder.description_for_number(pn, "en") or '—'
+    op      = carrier.name_for_number(pn, "en") or '—'
+    tz_list = timezone.time_zones_for_number(pn)
 
     res = {
         'valid':      valid,
         'country':    country,
-        'operator':   operator,
+        'operator':   op,
         'time_zones': ", ".join(tz_list) if tz_list else '—'
     }
     if NUMVERIFY_KEY:
@@ -118,76 +80,90 @@ def analyze_phone(number: str):
             ).json()
             res.update({
                 'nv_valid':     r.get('valid', valid),
-                'nv_carrier':   r.get('carrier', '—'),
-                'nv_line_type': r.get('line_type', '—')
+                'nv_carrier':   r.get('carrier','—'),
+                'nv_line_type': r.get('line_type','—')
             })
         except:
             pass
+    res.update(analyze_phone_osint(number))
     return res
 
-# ─── /info ────────────────────────────────────────────────────────
+# ─── COMMANDS ────────────────────────────────────────────────────
+@client.on(events.NewMessage(incoming=True, outgoing=True, pattern=r'^/start$'))
+async def start(event):
+    me = await client.get_me()
+    await event.reply(
+        f"Я User-бот @{me.username}\n"
+        "/info <@username│link│+71234567890>"
+    )
+
 @client.on(events.NewMessage(incoming=True, outgoing=True, pattern=r'/info(?: |$)(.+)'))
-async def info_handler(event):
+async def info(event):
     arg = event.pattern_match.group(1).strip()
     if arg.startswith('http'):
         arg = arg.rstrip('/').split('/')[-1]
 
-    # --- если это номер телефона
+    # 1) PHONE
     if arg.startswith('+') and any(c.isdigit() for c in arg):
-        await event.reply("🔍 Анализ номера…")
-        pd = analyze_phone(arg)
-        lines = [
-            f"• Номер: {arg}",
-            f"• Валиден: {pd['valid']}",
-            f"• Страна: {pd['country']}",
-            f"• Оператор: {pd['operator']}",
-            f"• Часовые пояса: {pd['time_zones']}"
-        ]
-        if 'nv_valid' in pd:
-            lines += [
-                f"• Numverify валиден: {pd['nv_valid']}",
-                f"• Numverify оператор: {pd['nv_carrier']}",
-                f"• Numverify тип: {pd['nv_line_type']}"
-            ]
-        return await event.reply("📲 Информация по номеру:\n" + "\n".join(lines))
+        data = analyze_phone(arg)
+        lines = [f"• {k}: {v}" for k,v in data.items()]
+        return await event.reply("📲 Phone Info:\n" + "\n".join(lines))
 
-    # --- иначе: профиль Telegram
+    # 2) TELEGRAM USER
     try:
-        ent = await client.get_entity(arg)
+        u = await client.get_entity(arg)
     except UsernameNotOccupiedError:
-        return await event.reply("❌ Пользователь не найден.")
+        return await event.reply("❌ Not found")
     except Exception as e:
-        return await event.reply(f"❌ Ошибка: {e}")
+        return await event.reply(f"❌ Error: {e}")
 
-    if not isinstance(ent, User):
-        return await event.reply("❗ Это не профиль Telegram-пользователя.")
+    if not isinstance(u, User):
+        return await event.reply("❗ Not a user profile")
 
-    msg = await event.reply("🔍 Собираю данные о пользователе…")
-    info = await fetch_user_info(ent)
-    fake, reasons = check_fake(info)
+    msg = await event.reply("🔍 Gathering user info…")
+    full = await client(GetFullUserRequest(u.id))
+    data = getattr(full, 'full_user', full)
 
-    lines = [
-        f"• id: {info['id']}",
-        f"• username: {info['username']}",
-        f"• name: {info['name']}",
-        f"• is_bot: {info['is_bot']}",
-        f"• is_verified: {info['is_verified']}",
-        f"• last_seen: {info['last_seen']}",
-        f"• about_len: {info['about_len']}",
-        f"• photos_count: {info['photos_count']}",
-        f"• common_chats: {info['common_chats']}",
-        f"• phone: {info['phone']}",
-        f"• tg_phone_registered: {info['tg_phone_reg']}"
-    ]
-    verdict = (
-        "⚠️ *Возможный фейк*:\n  – " + "\n  – ".join(reasons)
-    ) if fake else "✅ Похоже на реального пользователя"
-    await msg.edit("📊 Информация о пользователе:\n" + "\n".join(lines) + "\n\n" + verdict)
+    # last seen
+    last_seen = format_status(u.status)
 
-# ─── ЗАПУСК ───────────────────────────────────────────────────────
-def main():
-    print("🟢 User-бот запущен…", flush=True)
-    client.run_until_disconnected()
+    # mutual chats
+    common = await get_common_chats(u)
 
-if __name__ == '__main__':
-    main()
+    # phone registration
+    phone = getattr(data, 'phone', '—')
+    tg_reg = False
+    if phone != '—':
+        cnt = await client(ImportContactsRequest(contacts=[InputPhoneContact(0,phone,'','')]))
+        tg_reg = bool(cnt.users)
+        if tg_reg: await client(DeleteContactsRequest(id=[x.id for x in cnt.users]))
+
+    info = {
+        'id':           u.id,
+        'username':     u.username or '—',
+        'name':         f"{u.first_name or ''} {u.last_name or ''}".strip() or '—',
+        'is_bot':       u.bot,
+        'is_verified':  bool(getattr(data,'bot_info',None)),
+        'last_seen':    last_seen,
+        'about_len':    len(getattr(data,'about','') or ''),
+        'photos_cnt':   (await client.get_profile_photos(u, limit=0)).total,
+        'common_chats': len(common),
+        'common_list':  ", ".join(common) or '—',
+        'phone':        phone,
+        'tg_phone':     tg_reg
+    }
+
+    # fake heuristic
+    reasons = []
+    if info['about_len']==0:    reasons.append("no bio")
+    if info['photos_cnt']==0:   reasons.append("no photos")
+    if info['common_chats']==0: reasons.append("no mutual chats")
+    fake = len(reasons)>=2
+
+    lines = [f"• {k}: {v}" for k,v in info.items()]
+    verdict = ("⚠️ Fake? Reasons:\n  – " + "\n  – ".join(reasons)) if fake else "✅ Seems real"
+    await msg.edit("📊 User Info:\n" + "\n".join(lines)+"\n\n"+verdict)
+
+# ─── RUN ─────────────────────────────────────────────────────────
+print("🟢 Bot started…")
+client.run_until_disconnected()
