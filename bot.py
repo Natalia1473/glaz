@@ -2,14 +2,14 @@ import os
 import threading
 import statistics
 from datetime import datetime
+import asyncio
+import http.server
+import socketserver
 
 from telethon import TelegramClient, events
 from telethon.errors import UsernameNotOccupiedError
 from telethon.tl.types import User
 from telethon.tl.functions.users import GetFullUserRequest
-
-import http.server
-import socketserver
 
 import phonenumbers
 from phonenumbers import geocoder, carrier, timezone
@@ -18,24 +18,27 @@ import requests
 # ─── ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ─────────────────────────────────────────
 API_ID        = int(os.environ['API_ID'])
 API_HASH      = os.environ['API_HASH']
-NUMVERIFY_KEY = os.environ.get('NUMVERIFY_KEY')  # ваш ключ Numverify, если есть
+NUMVERIFY_KEY = os.environ.get('NUMVERIFY_KEY')  # опционально
 PORT          = int(os.environ.get('PORT', 8000))
 
-# ─── HTTP-ping для Render ────────────────────────────────────────
+# ─── HTTP-ping для Render ─────────────────────────────────────────
 class PingHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
-    def log_message(self, *args): pass
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass
 
 def run_http():
     with socketserver.TCPServer(("", PORT), PingHandler) as srv:
         srv.serve_forever()
 
-# ─── Телеграм-клиент (user-сессия) ───────────────────────────────
+# ─── Инициализация Telethon (user-сессия) ─────────────────────────
 client = TelegramClient('user_session', API_ID, API_HASH)
 client.start()
 
-# ─── Стартовый ответ ──────────────────────────────────────────────
+# ─── Обработчики команд ────────────────────────────────────────────
 @client.on(events.NewMessage(incoming=True, outgoing=True, pattern=r'^/start$'))
 async def start_handler(event):
     await event.reply(
@@ -43,7 +46,7 @@ async def start_handler(event):
         "/info <username_or_link_or_phone>"
     )
 
-# ─── Сбор данных о Telegram-пользователе ──────────────────────────
+# ─── Сбор и проверка данных ────────────────────────────────────────
 async def fetch_user_info(u: User):
     full = await client(GetFullUserRequest(u.id))
     data = getattr(full, 'full_user', full)
@@ -59,77 +62,69 @@ async def fetch_user_info(u: User):
         'common_chats': getattr(data, 'common_chats_count', 0),
     }
 
-# ─── Проверка на фейк (эвристики) ────────────────────────────────
-def check_fake(info: dict) -> (bool, list[str]):
+def check_fake(info: dict):
     reasons = []
-    if info.get('about_len', 0) == 0:
-        reasons.append("нет био")
-    if info.get('photos_count', 0) == 0:
-        reasons.append("нет фото профиля")
-    if info.get('common_chats', 0) == 0:
-        reasons.append("нет общих чатов")
-    is_fake = len(reasons) >= 2
-    return is_fake, reasons
+    if info['about_len'] == 0:    reasons.append("нет био")
+    if info['photos_count'] == 0: reasons.append("нет фото профиля")
+    if info['common_chats'] == 0: reasons.append("нет общих чатов")
+    return len(reasons) >= 2, reasons
 
-# ─── Анализ номера через phonenumbers и Numverify ─────────────────
-def analyze_phone(number: str) -> dict:
+def analyze_phone(number: str):
     pn = phonenumbers.parse(number, None)
-    valid = phonenumbers.is_valid_number(pn)
-    country = geocoder.description_for_number(pn, "en")
-    op = carrier.name_for_number(pn, "en")
-    tz = timezone.time_zones_for_number(pn)
-    result = {
+    valid  = phonenumbers.is_valid_number(pn)
+    country = geocoder.description_for_number(pn, "en") or '—'
+    op      = carrier.name_for_number(pn, "en") or '—'
+    tz      = timezone.time_zones_for_number(pn)
+    res = {
         'valid': valid,
-        'country': country or '—',
-        'operator': op or '—',
+        'country': country,
+        'operator': op,
         'time_zones': ", ".join(tz) if tz else '—'
     }
-    # Numverify API
     if NUMVERIFY_KEY:
         try:
             r = requests.get(
                 "http://apilayer.net/api/validate",
                 params={'access_key': NUMVERIFY_KEY, 'number': number}
             ).json()
-            result.update({
-                'numverify_line_type': r.get('line_type', '—'),
-                'numverify_carrier': r.get('carrier', '—'),
-                'numverify_valid': r.get('valid', valid)
+            res.update({
+                'nv_valid': r.get('valid', valid),
+                'nv_carrier': r.get('carrier', '—'),
+                'nv_line_type': r.get('line_type', '—')
             })
-        except Exception:
+        except:
             pass
-    return result
+    return res
 
-# ─── Обработчик /info ─────────────────────────────────────────────
 @client.on(events.NewMessage(incoming=True, outgoing=True, pattern=r'/info(?: |$)(.+)'))
 async def info_handler(event):
     arg = event.pattern_match.group(1).strip()
     if arg.startswith('http'):
         arg = arg.rstrip('/').split('/')[-1]
 
-    # если похоже на номер телефона
-    if arg.startswith('+') and any(ch.isdigit() for ch in arg):
+    # телефон
+    if arg.startswith('+') and any(c.isdigit() for c in arg):
         await event.reply("🔍 Анализ номера…")
         try:
-            phone_data = analyze_phone(arg)
+            pd = analyze_phone(arg)
         except Exception as e:
             return await event.reply(f"❌ Ошибка анализа номера: {e}")
         lines = [
             f"• Номер: {arg}",
-            f"• Валиден: {phone_data['valid']}",
-            f"• Страна: {phone_data['country']}",
-            f"• Оператор: {phone_data['operator']}",
-            f"• Часовые пояса: {phone_data['time_zones']}"
+            f"• Валиден: {pd['valid']}",
+            f"• Страна: {pd['country']}",
+            f"• Оператор: {pd['operator']}",
+            f"• Часовые пояса: {pd['time_zones']}"
         ]
-        if 'numverify_line_type' in phone_data:
+        if 'nv_valid' in pd:
             lines += [
-                f"• Numverify valid: {phone_data['numverify_valid']}",
-                f"• Numverify carrier: {phone_data['numverify_carrier']}",
-                f"• Numverify line type: {phone_data['numverify_line_type']}"
+                f"• Numverify валиден: {pd['nv_valid']}",
+                f"• Numverify оператор: {pd['nv_carrier']}",
+                f"• Numverify тип: {pd['nv_line_type']}"
             ]
         return await event.reply("📲 Информация по номеру:\n" + "\n".join(lines))
 
-    # иначе — аккаунт Telegram
+    # Telegram-пользователь
     try:
         ent = await client.get_entity(arg)
     except UsernameNotOccupiedError:
@@ -138,7 +133,7 @@ async def info_handler(event):
         return await event.reply(f"❌ Ошибка при поиске: {e}")
 
     if not isinstance(ent, User):
-        return await event.reply("❗ Это не профиль пользователя Telegram.")
+        return await event.reply("❗ Это не профиль Telegram-пользователя.")
 
     msg = await event.reply("🔍 Собираю данные о пользователе…")
     try:
@@ -146,7 +141,7 @@ async def info_handler(event):
     except Exception as e:
         return await msg.edit(f"❌ Не удалось получить данные: {e}")
 
-    is_fake, reasons = check_fake(info)
+    fake, reasons = check_fake(info)
     lines = [
         f"• id: {info['id']}",
         f"• username: {info['username']}",
@@ -158,13 +153,17 @@ async def info_handler(event):
         f"• photos_count: {info['photos_count']}",
         f"• common_chats: {info['common_chats']}"
     ]
-    verdict = ("⚠️ *Возможный фейк*:\n  – " + "\n  – ".join(reasons)) if is_fake else "✅ Похоже на реального пользователя"
+    verdict = ("⚠️ *Возможный фейк*:\n  – " + "\n  – ".join(reasons)) if fake else "✅ Похоже на реального пользователя"
     await msg.edit("📊 Информация о пользователе:\n" + "\n".join(lines) + "\n\n" + verdict)
 
-# ─── Запуск ───────────────────────────────────────────────────────
+# ─── Запуск и отладочный вывод ─────────────────────────────────────
 def main():
     threading.Thread(target=run_http, daemon=True).start()
-    print("User-бот запущен…")
+    print("🟢 User-бот запущен…", flush=True)
+    async def whoami():
+        me = await client.get_me()
+        print("  ↳ Running as:", me.username, flush=True)
+    threading.Thread(target=lambda: asyncio.run(whoami()), daemon=True).start()
     client.run_until_disconnected()
 
 if __name__ == '__main__':
