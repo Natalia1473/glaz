@@ -11,44 +11,41 @@ from telethon.tl.functions.users import GetFullUserRequest
 import http.server
 import socketserver
 
-# ─── ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ─────────────────────────────────────────
+# ─── ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ────────────────────────────────────────
 API_ID   = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
 PORT     = int(os.environ.get('PORT', 8000))
 
-# ─── HTTP-сервер для Render (чтобы было прослушиваемое порт) ───────
+# ─── HTTP-ping для Render ────────────────────────────────────────
 class PingHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, fmt, *args):
+    def log_message(self, *args):
         pass
 
 def run_http():
     with socketserver.TCPServer(("", PORT), PingHandler) as srv:
         srv.serve_forever()
 
-# ─── ИНИЦИАЛИЗАЦИЯ ТЕЛЕФОННОГО КЛИЕНТА (ПОЛЬЗОВАТЕЛЬСКАЯ СЕССИЯ) ───
-# Обратите внимание: имя сессии должно совпадать с файлом user_session.session
+# ─── Инициализация Telethon (user-сессия) ─────────────────────────
 client = TelegramClient('user_session', API_ID, API_HASH)
-client.start()  # Читает из user_session.session, никакого токена
+client.start()
 
-# ─── ОБРАБОТЧИК /start ─────────────────────────────────────────────
-@client.on(events.NewMessage(pattern=r'^/start$'))
+# ─── /start ───────────────────────────────────────────────────────
+@client.on(events.NewMessage(incoming=True, outgoing=True, pattern=r'^/start$'))
 async def start_handler(event):
     await event.reply(
-        "Привет! Я User-бот, могу собрать публичные данные о пользователе.\n"
-        "Используй: /info <username_or_link>"
+        "Привет! Я User-бот. Отправь мне:\n"
+        "/info <username_or_link>\n"
+        "— и я соберу публичные данные и проверю на признаки фейка."
     )
 
-# ─── ФУНКЦИЯ СБОРА ИНФОРМАЦИИ О USER ───────────────────────────────
+# ─── Сбор данных о пользователе ────────────────────────────────────
 async def fetch_user_info(u: User):
-    # Получаем полную информацию
     full = await client(GetFullUserRequest(u.id))
     data = getattr(full, 'full_user', full)
-
-    # Собираем поля
     return {
         'id':           u.id,
         'username':     u.username or '—',
@@ -56,28 +53,39 @@ async def fetch_user_info(u: User):
         'is_bot':       u.bot,
         'is_verified':  bool(getattr(data, 'bot_info', None)),
         'status':       str(u.status or ''),
-        'about':        getattr(data, 'about', '') or '—',
         'about_len':    len(getattr(data, 'about', '') or ''),
         'photos_count': (await client.get_profile_photos(u, limit=0)).total,
         'common_chats': getattr(data, 'common_chats_count', 0),
     }
 
-# ─── ОБРАБОТЧИК /info ──────────────────────────────────────────────
-@client.on(events.NewMessage(pattern=r'/info(?: |$)(.+)'))
+# ─── Эвристики фейка ──────────────────────────────────────────────
+def check_fake(info: dict) -> (bool, list[str]):
+    reasons = []
+    if info['about_len'] == 0:
+        reasons.append("нет био")
+    if info['photos_count'] == 0:
+        reasons.append("нет фото профиля")
+    if info['common_chats'] == 0:
+        reasons.append("нет общих чатов")
+    is_fake = len(reasons) >= 2
+    return is_fake, reasons
+
+# ─── /info ───────────────────────────────────────────────────────
+@client.on(events.NewMessage(incoming=True, outgoing=True, pattern=r'/info(?: |$)(.+)'))
 async def info_handler(event):
-    target = event.pattern_match.group(1).strip()
-    if target.startswith('http'):
-        target = target.rstrip('/').split('/')[-1]
+    arg = event.pattern_match.group(1).strip()
+    if arg.startswith('http'):
+        arg = arg.rstrip('/').split('/')[-1]
 
     try:
-        ent = await client.get_entity(target)
+        ent = await client.get_entity(arg)
     except UsernameNotOccupiedError:
         return await event.reply("❌ Пользователь не найден.")
     except Exception as e:
         return await event.reply(f"❌ Ошибка при поиске: {e}")
 
     if not isinstance(ent, User):
-        return await event.reply("❗ Это не аккаунт. Я работаю только с физлицами.")
+        return await event.reply("❗ Я работаю только с аккаунтами пользователей.")
 
     msg = await event.reply("🔍 Собираю данные…")
     try:
@@ -85,14 +93,26 @@ async def info_handler(event):
     except Exception as e:
         return await msg.edit(f"❌ Не удалось получить данные: {e}")
 
-    text = "📊 Информация о пользователе:\n" + "\n".join(
-        f"• {k}: {v}" for k, v in info.items()
-    )
-    await msg.edit(text)
+    # проверяем на фейк
+    is_fake, reasons = check_fake(info)
 
-# ─── ЗАПУСК БОТА ───────────────────────────────────────────────────
+    # формируем ответ
+    lines = [
+        f"• id: {info['id']}",
+        f"• username: {info['username']}",
+        f"• name: {info['name']}",
+        f"• is_bot: {info['is_bot']}",
+        f"• is_verified: {info['is_verified']}",
+        f"• status: {info['status']}",
+        f"• about_len: {info['about_len']}",
+        f"• photos_count: {info['photos_count']}",
+        f"• common_chats: {info['common_chats']}",
+    ]
+    verdict = ("⚠️ *Возможный фейк*:\n" + "  – ".join(reasons)) if is_fake else "✅ Похоже на реального пользователя"
+    await msg.edit("📊 Информация о пользователе:\n" + "\n".join(lines) + "\n\n" + verdict)
+
+# ─── Запуск ───────────────────────────────────────────────────────
 def main():
-    # Запускаем HTTP-ping
     threading.Thread(target=run_http, daemon=True).start()
     print("User-бот запущен…")
     client.run_until_disconnected()
